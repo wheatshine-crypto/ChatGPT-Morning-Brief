@@ -98,63 +98,86 @@ def run_nbs() -> dict[str, Any]:
         # The upstream package defaults verify=False; override it explicitly.
         client = NBSFetcher(
             verify=True,
-            timeout=TIMEOUT_SECONDS,
-            max_retries=1,
-            retry_backoff=0,
+            timeout=45,
+            max_retries=2,
+            retry_backoff=1,
             auto_session=result["auto_browser_session"],
         )
         result["request_url"] = (
             "https://data.stats.gov.cn/dg/website/publicrelease/web/external/"
-            "new/queryIndexTreeAsync (and related public monthly-data endpoints)"
+            "new/queryIndexTreeAsync; queryIndicatorsByCid; stream/esData"
         )
 
         roots = client.tree("monthData")
-        result["raw_data"] = {"root_catalogue": roots}
         if not isinstance(roots, list) or not roots:
             raise RuntimeError("NBS returned an empty monthly-data catalogue.")
 
-        # Bounded breadth-first traversal: locate a CPI-related catalogue node.
-        queue: list[tuple[dict[str, Any], list[str]]] = [
-            (node, [str(node.get("name", ""))]) for node in roots if isinstance(node, dict)
+        # Traverse the live catalogue breadth-first. The first version stopped
+        # after 45 nodes, before reaching the price-indicator branch.
+        queue: list[tuple[dict[str, Any], list[str], int]] = [
+            (node, [str(node.get("name") or node.get("_name") or "")], 0)
+            for node in roots if isinstance(node, dict)
         ]
         visited = 0
-        max_nodes = 45
-        max_depth = 6
-        keywords = ("居民消费价格指数", "居民消费价格", "CPI")
+        max_nodes = 600
+        max_depth = 12
+        seen_ids: set[str] = set()
+        matching_nodes: list[dict[str, Any]] = []
         candidate = None
 
         while queue and visited < max_nodes:
-            node, path = queue.pop(0)
+            node, path, depth = queue.pop(0)
+            node_id = str(node.get("_id") or "")
+            if node_id and node_id in seen_ids:
+                continue
+            if node_id:
+                seen_ids.add(node_id)
             visited += 1
-            node_id = node.get("_id")
-            node_name = str(node.get("name", ""))
-            if node_id and any(word in node_name.upper() for word in keywords):
-                items = client.indicators("monthData", cid=str(node_id))
-                if items:
-                    candidate = (node, path, items)
+            node_name = str(node.get("name") or node.get("_name") or "")
+            searchable = " / ".join(path + [node_name]).upper()
+
+            # Query indicator metadata only on potentially relevant branches.
+            if any(term in searchable for term in ("价格", "CPI", "居民消费")):
+                indicators = client.indicators("monthData", cid=node_id) if node_id else []
+                labels = [str(item.get("label", "")) for item in indicators]
+                matching_nodes.append({
+                    "path": path,
+                    "node_id": node_id,
+                    "node_name": node_name,
+                    "indicator_labels": labels,
+                })
+                preferred_items = [
+                    item for item in indicators
+                    if any(term in str(item.get("label", "")).upper()
+                           for term in ("居民消费价格", "CPI"))
+                ]
+                if preferred_items:
+                    preferred_items.sort(
+                        key=lambda item: (
+                            0 if "同比" in str(item.get("label", "")) else 1,
+                            0 if "居民消费价格指数" in str(item.get("label", "")) else 1,
+                        )
+                    )
+                    candidate = (node, path, preferred_items[0])
                     break
-            if len(path) < max_depth and node_id:
-                children = client.tree("monthData", pid=str(node_id))
+
+            if depth < max_depth and node_id and not node.get("isLeaf", False):
+                children = client.tree("monthData", pid=node_id)
                 for child in children:
                     if isinstance(child, dict):
-                        queue.append((child, path + [str(child.get("name", ""))]))
+                        child_name = str(child.get("name") or child.get("_name") or "")
+                        queue.append((child, path + [child_name], depth + 1))
 
         result["catalogue_nodes_checked"] = visited
+        result["catalogue_nodes_limit"] = max_nodes
+        result["catalogue_matches"] = matching_nodes
         if candidate is None:
             raise RuntimeError(
-                "Could not locate a CPI-related monthly indicator within the bounded "
-                f"catalogue scan ({visited} nodes). The root catalogue is preserved in raw_data."
+                "CPI indicator not found in the expanded monthly catalogue scan "
+                f"({visited} nodes; limit={max_nodes}). Catalogue matches are preserved."
             )
 
-        node, path, indicators = candidate
-        preferred = next(
-            (
-                item for item in indicators
-                if item.get("series_type") == "yoy_growth"
-                or "同比" in str(item.get("label", ""))
-            ),
-            indicators[0],
-        )
+        node, path, preferred = candidate
         indicator_id = preferred.get("indicator_id")
         if not indicator_id:
             raise RuntimeError("The matched NBS indicator did not include an indicator_id.")
@@ -198,6 +221,7 @@ def run_nbs() -> dict[str, Any]:
         }
         result["raw_data"] = {
             "root_catalogue": roots,
+            "catalogue_matches": matching_nodes,
             "raw_fetch_response": raw_result,
         }
         result["status"] = "success"
@@ -212,45 +236,85 @@ def run_fred() -> dict[str, Any]:
         "Federal Reserve Bank of St. Louis - FRED",
         "https://fred.stlouisfed.org/series/DGS2",
     )
+    result["request_strategy"] = (
+        "One series per CSV request; bounded retries with increasing timeouts."
+    )
     try:
         end_date = date.today()
-        start_date = end_date - timedelta(days=21)
-        params = {
-            "id": "DGS2,DGS10,DGS30",
-            "cosd": start_date.isoformat(),
-            "coed": end_date.isoformat(),
-        }
-        request_url = f"{FRED_SOURCE_URL}?{urlencode(params)}"
-        response = requests.get(
-            request_url,
-            headers=HEADERS,
-            timeout=TIMEOUT_SECONDS,
-            verify=True,
-        )
-        response.raise_for_status()
-        response.encoding = "utf-8"
-        text = response.text
-        reader = csv.DictReader(io.StringIO(text))
-        rows = list(reader)
-        if not rows or not reader.fieldnames:
-            raise RuntimeError("FRED returned an empty CSV response.")
-        date_field = reader.fieldnames[0]
-        observations = [
-            row for row in rows
-            if any(row.get(series) not in (None, "", ".") for series in ("DGS2", "DGS10", "DGS30"))
-        ]
-        if not observations:
-            raise RuntimeError("FRED CSV contained no non-missing yield observations.")
-        latest = max(observations, key=lambda row: row.get(date_field, ""))
-        result["request_url"] = request_url
-        result["data_date"] = latest.get(date_field)
-        result["raw_data"] = text
+        start_date = end_date - timedelta(days=30)
+        series_ids = ("DGS2", "DGS10", "DGS30")
+        raw_responses: dict[str, str] = {}
+        latest_by_series: dict[str, dict[str, str]] = {}
+        errors: dict[str, str] = {}
+        request_urls: dict[str, str] = {}
+
+        session = requests.Session()
+        session.headers.update(HEADERS)
+
+        for series in series_ids:
+            params = {
+                "id": series,
+                "cosd": start_date.isoformat(),
+                "coed": end_date.isoformat(),
+            }
+            request_url = f"{FRED_SOURCE_URL}?{urlencode(params)}"
+            request_urls[series] = request_url
+            last_error = None
+
+            # A timeout is treated as transient: retry once with a longer
+            # read window. Separate requests also avoid a large combined CSV.
+            for attempt, timeout in enumerate((45, 75), start=1):
+                try:
+                    response = session.get(
+                        request_url,
+                        timeout=(15, timeout),
+                        verify=True,
+                    )
+                    response.raise_for_status()
+                    response.encoding = "utf-8"
+                    csv_text = response.text
+                    reader = csv.DictReader(io.StringIO(csv_text))
+                    rows = list(reader)
+                    if not rows or not reader.fieldnames:
+                        raise RuntimeError(f"FRED returned an empty CSV for {series}.")
+                    date_field = reader.fieldnames[0]
+                    observations = [
+                        row for row in rows
+                        if row.get(series) not in (None, "", ".")
+                    ]
+                    if not observations:
+                        raise RuntimeError(f"FRED CSV contained no observations for {series}.")
+                    latest_by_series[series] = max(
+                        observations, key=lambda row: row.get(date_field, "")
+                    )
+                    raw_responses[series] = csv_text
+                    last_error = None
+                    break
+                except (requests.RequestException, RuntimeError, ValueError) as exc:
+                    last_error = f"attempt {attempt}: {type(exc).__name__}: {exc}"
+                    if attempt == 1:
+                        import time
+                        time.sleep(3)
+
+            if last_error:
+                errors[series] = last_error
+
+        result["request_url"] = request_urls
+        result["raw_data"] = raw_responses
         result["parsed_data"] = {
-            "series": ["DGS2", "DGS10", "DGS30"],
+            "series": list(series_ids),
             "units": "percent per annum",
-            "latest_observation": latest,
-            "recent_observations": observations[-10:],
+            "latest_observations": latest_by_series,
+            "series_errors": errors,
         }
+        if errors:
+            raise RuntimeError(
+                "FRED did not return all required Treasury series: "
+                + "; ".join(f"{key}={value}" for key, value in errors.items())
+            )
+
+        dates = [row.get("observation_date", row.get("DATE", "")) for row in latest_by_series.values()]
+        result["data_date"] = max((value for value in dates if value), default=None)
         result["status"] = "success"
         result["success"] = True
         return result
