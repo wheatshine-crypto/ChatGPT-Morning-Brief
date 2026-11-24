@@ -1,0 +1,38 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+*_token*
+*_secret*
+
+# Local configuration (publish sanitized examples only)
+config/*
+!config/*.example.json
+!config/*.example.yaml
+!config/*.example.yml
+
+# Generated output and logs
+output/*
+logs/*
+*.log
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
