@@ -1,0 +1,63 @@
+name: Manual public data source tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-public-data-source-tests
+  cancel-in-progress: false
+
+jobs:
+  smoke-tests:
+    name: Test NBS, FRED, and U.S. Treasury
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements.txt
+          python -m pip install "playwright>=1.44"
+
+      - name: Install Chromium for the optional NBS browser session
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run the three source tests
+        id: source-tests
+        continue-on-error: true
+        env:
+          NBS_AUTO_SESSION: "1"
+          PYTHONUNBUFFERED: "1"
+        run: python tests/run_smoke_tests.py
+
+      - name: Upload raw responses and test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-data-source-test-results
+          path: tests/output/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Report source test outcome
+        if: always()
+        run: |
+          if [ "${{ steps.source-tests.outcome }}" = "success" ]; then
+            echo "All three source tests passed."
+          else
+            echo "One or more source tests failed. Download the artifact to inspect each JSON result."
+            exit 1
+          fi
